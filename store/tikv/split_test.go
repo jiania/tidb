@@ -15,7 +15,6 @@ package tikv
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv/mock-tikv"
 )
 
@@ -45,20 +44,20 @@ func (s *testSplitSuite) split(c *C, regionID uint64, key []byte) {
 	s.cluster.Split(regionID, newRegionID, key, []uint64{peerID}, peerID)
 }
 
-func (s *testSplitSuite) TestSplitBatchGet(c *C) {
-	firstRegion, err := s.store.regionCache.GetRegion([]byte("a"))
-	c.Assert(err, IsNil)
-
-	txn := s.begin(c)
-	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()})
-	multiGets, err := snapshot.makeBatchGetReqs([]kv.Key{kv.Key("a"), kv.Key("b"), kv.Key("c")})
-	c.Assert(err, IsNil)
-
-	s.split(c, firstRegion.GetID(), []byte("b"))
-	s.store.regionCache.DropRegion(firstRegion.VerID())
-
-	for _, g := range multiGets {
-		// mock-tikv will panic if it meets a not-in-region key.
-		snapshot.doBatchGet(g)
-	}
-}
+//func (s *testSplitSuite) TestSplitBatchGet(c *C) {
+//	firstRegion, err := s.store.regionCache.GetRegion([]byte("a"))
+//	c.Assert(err, IsNil)
+//
+//	txn := s.begin(c)
+//	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()})
+//	multiGets, err := snapshot.makeBatchGetReqs([]kv.Key{kv.Key("a"), kv.Key("b"), kv.Key("c")})
+//	c.Assert(err, IsNil)
+//
+//	s.split(c, firstRegion.GetID(), []byte("b"))
+//	s.store.regionCache.DropRegion(firstRegion.VerID())
+//
+//	for _, g := range multiGets {
+//		// mock-tikv will panic if it meets a not-in-region key.
+//		snapshot.doBatchGet(g)
+//	}
+//}

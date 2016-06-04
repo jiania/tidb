@@ -14,6 +14,8 @@
 package tikv
 
 import (
+	"sync"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
@@ -28,8 +30,7 @@ var (
 
 const (
 	scanBatchSize = 100
-	maxGetCount   = 3
-	batchGetSize  = 100
+	batchGetSize  = 5120
 )
 
 // tikvSnapshot implements MvccSnapshot interface.
@@ -46,116 +47,118 @@ func newTiKVSnapshot(store *tikvStore, ver kv.Version) *tikvSnapshot {
 	}
 }
 
-// makeBatchGetReqs splits each key into corresponding region.
-func (s *tikvSnapshot) makeBatchGetReqs(keys []kv.Key) (map[RegionVerID]*batchGetRegion, error) {
-	startTS := s.version.Ver
-	multiBatchGet := map[RegionVerID]*batchGetRegion{}
-	for _, k := range keys {
-		region, err := s.store.regionCache.GetRegion(k)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		regionID := region.VerID()
-		singleBatchGet, ok := multiBatchGet[regionID]
-		if !ok {
-			singleBatchGet = &batchGetRegion{
-				CmdBatchGetRequest: &pb.CmdBatchGetRequest{
-					Version: proto.Uint64(startTS),
-				},
-				region: regionID,
-			}
-			multiBatchGet[regionID] = singleBatchGet
-		}
-		cmdBatchGetReq := singleBatchGet.CmdBatchGetRequest
-		cmdBatchGetReq.Keys = append(cmdBatchGetReq.Keys, k)
-	}
-	return multiBatchGet, nil
-}
-
-// doBatchGet sends BatchGet RPC request. If any key is locked, use tikvSnapshot.Get() to retry.
-func (s *tikvSnapshot) doBatchGet(singleBatchGet *batchGetRegion) (map[string][]byte, error) {
-	cmdBatchGetReq := singleBatchGet.CmdBatchGetRequest
-	keys := cmdBatchGetReq.GetKeys()
-	if len(keys) == 0 {
-		return nil, nil
-	}
-	req := &pb.Request{
-		Type:           pb.MessageType_CmdBatchGet.Enum(),
-		CmdBatchGetReq: cmdBatchGetReq,
-	}
-	resp, err := s.store.SendKVReq(req, singleBatchGet.region)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if regionErr := resp.GetRegionError(); regionErr != nil {
-		//TODO: retry internally
-		return nil, errors.Annotate(errors.New(regionErr.String()), txnRetryableMark)
-	}
-	cmdBatchGetResp := resp.GetCmdBatchGetResp()
-	if cmdBatchGetResp == nil {
-		return nil, errors.Trace(errBodyMissing)
-	}
-	pairs := cmdBatchGetResp.GetPairs()
-	m := make(map[string][]byte, len(pairs))
-	for _, pair := range pairs {
-		keyErr := pair.GetError()
-		if keyErr == nil {
-			if val := pair.GetValue(); len(val) > 0 {
-				m[string(pair.GetKey())] = val
-			}
-			continue
-		}
-		lockInfo, err := extractLockInfoFromKeyErr(keyErr)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		val, err := s.Get(lockInfo.GetKey())
-		if err != nil {
-			if terror.ErrorEqual(err, kv.ErrNotExist) {
-				continue
-			}
-			return nil, errors.Trace(err)
-		}
-		m[string(lockInfo.GetKey())] = val
-	}
-	return m, nil
-}
-
 // BatchGet gets all the keys' value from kv-server and returns a map contains key/value pairs.
 // The map will not contain nonexistent keys.
 func (s *tikvSnapshot) BatchGet(keys []kv.Key) (map[string][]byte, error) {
-	m := make(map[string][]byte, len(keys))
-
-	multiBatchGet, err := s.makeBatchGetReqs(keys)
+	bytesKeys := make([][]byte, len(keys))
+	for i, k := range keys {
+		bytesKeys[i] = []byte(k)
+	}
+	mu := &sync.Mutex{}
+	m := make(map[string][]byte)
+	err := s.batchGetKeysByRegions(bytesKeys, func(k, v []byte) {
+		if len(v) == 0 {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		m[string(k)] = v
+	})
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	for _, singleBatchGet := range multiBatchGet {
-		keys := singleBatchGet.GetKeys()
-		for startIdx := 0; startIdx < len(keys); startIdx += batchGetSize {
-			endIdx := startIdx + batchGetSize
-			if endIdx > len(keys) {
-				endIdx = len(keys)
-			}
-			newSingleBatchGet := &batchGetRegion{
-				CmdBatchGetRequest: &pb.CmdBatchGetRequest{
-					Keys:    keys[startIdx:endIdx],
-					Version: proto.Uint64(singleBatchGet.GetVersion()),
-				},
-				region: singleBatchGet.region,
-			}
-			res, err := s.doBatchGet(newSingleBatchGet)
+	return m, nil
+}
+
+func (s *tikvSnapshot) batchGetKeysByRegions(keys [][]byte, f func(k, v []byte)) error {
+	groups := make(map[RegionVerID][][]byte)
+	var lastRegion *Region
+	for _, k := range keys {
+		var region *Region
+		if lastRegion != nil && lastRegion.Contains(k) {
+			region = lastRegion
+		} else {
+			var err error
+			region, err = s.store.regionCache.GetRegion(k)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return errors.Trace(err)
 			}
-			m, err = mergeResult(m, res)
-			if err != nil {
-				return nil, errors.Trace(err)
+			lastRegion = region
+		}
+		id := region.VerID()
+		groups[id] = append(groups[id], k)
+	}
+	// Parallel requests.
+	ch := make(chan error)
+	cnt := 0
+	for id, g := range groups {
+		for start := 0; start < len(g); start += batchGetSize {
+			end := start + batchGetSize
+			if end > len(g) {
+				end = len(g)
 			}
+			go func(id RegionVerID, g [][]byte) {
+				ch <- s.batchGetSingleRegion(id, g, f)
+			}(id, g[start:end])
+			cnt++
 		}
 	}
+	var err error
+	for i := 0; i < cnt; i++ {
+		if e := <-ch; e != nil {
+			err = errors.Trace(e)
+		}
+	}
+	return err
+}
 
-	return m, nil
+func (s *tikvSnapshot) batchGetSingleRegion(id RegionVerID, keys [][]byte, f func(k, v []byte)) error {
+	pending := keys
+
+	var backoffErr error
+	for backoff := txnLockBackoff(); backoffErr == nil; backoffErr = backoff() {
+		req := &pb.Request{
+			Type: pb.MessageType_CmdBatchGet.Enum(),
+			CmdBatchGetReq: &pb.CmdBatchGetRequest{
+				Keys:    pending,
+				Version: proto.Uint64(s.version.Ver),
+			},
+		}
+		resp, err := s.store.SendKVReq(req, id)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if regionErr := resp.GetRegionError(); regionErr != nil {
+			err = s.batchGetKeysByRegions(pending, f)
+			return errors.Trace(err)
+		}
+		batchGetResp := resp.GetCmdBatchGetResp()
+		if batchGetResp == nil {
+			return errors.Trace(errBodyMissing)
+		}
+		pending = [][]byte{}
+		for _, pair := range batchGetResp.Pairs {
+			keyErr := pair.GetError()
+			if keyErr == nil {
+				f(pair.GetKey(), pair.GetValue())
+				continue
+			}
+			val, err := s.handleKeyError(keyErr)
+			if err != nil {
+				if terror.ErrorNotEqual(err, errInnerRetryable) {
+					return errors.Trace(err)
+				}
+				pending = append(pending, pair.GetKey())
+				continue
+			}
+			f(pair.GetKey(), val)
+		}
+		if len(pending) > 0 {
+			continue
+		}
+		return nil
+	}
+	return errors.Annotate(backoffErr, txnRetryableMark)
 }
 
 // Get gets the value for key k from snapshot.
@@ -253,26 +256,4 @@ func (s *tikvSnapshot) handleKeyError(keyErr *pb.KeyError) ([]byte, error) {
 		return nil, errors.Trace(err)
 	}
 	return val, nil
-}
-
-// mergeResult Merge d2 into d1. If d1 and d2 are overlap, it returns error.
-func mergeResult(d1, d2 map[string][]byte) (map[string][]byte, error) {
-	if d1 == nil {
-		d1 = make(map[string][]byte)
-	}
-	for k2, v2 := range d2 {
-		if v1, ok := d1[k2]; ok {
-			// Because compare []byte takes too much time,
-			// if conflict return error directly even their values are same.
-			return nil, errors.Errorf("add dict conflict key[%s] v1[%q] v2[%q]",
-				k2, v1, v2)
-		}
-		d1[k2] = v2
-	}
-	return d1, nil
-}
-
-type batchGetRegion struct {
-	*pb.CmdBatchGetRequest
-	region RegionVerID
 }
