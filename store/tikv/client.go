@@ -51,7 +51,7 @@ type rpcClient struct {
 
 const (
 	initConnection int           = 0
-	maxConnecion   int           = 20
+	maxConnecion   int           = 50
 	readTimeout    time.Duration = 5 * time.Second // seconds
 	writeTimeout   time.Duration = 5 * time.Second // seconds
 	connectTimeout time.Duration = 5 * time.Second // seconds

@@ -40,17 +40,22 @@ type tikvTxn struct {
 }
 
 func newTiKVTxn(store *tikvStore) (*tikvTxn, error) {
-	startTS, err := store.oracle.GetTimestamp()
-	if err != nil {
-		return nil, errors.Trace(err)
+	var backoffErr error
+	for backoff := pdBackoff(); backoffErr == nil; backoffErr = backoff() {
+		startTS, err := store.oracle.GetTimestamp()
+		if err != nil {
+			log.Warnf("get timestamp failed: %v, retry later", err)
+			continue
+		}
+		ver := kv.NewVersion(startTS)
+		return &tikvTxn{
+			us:      kv.NewUnionStore(newTiKVSnapshot(store, ver)),
+			store:   store,
+			startTS: startTS,
+			valid:   true,
+		}, nil
 	}
-	ver := kv.NewVersion(startTS)
-	return &tikvTxn{
-		us:      kv.NewUnionStore(newTiKVSnapshot(store, ver)),
-		store:   store,
-		startTS: startTS,
-		valid:   true,
-	}, nil
+	return nil, errors.Annotate(backoffErr, txnRetryableMark)
 }
 
 // Implement transaction interface.
